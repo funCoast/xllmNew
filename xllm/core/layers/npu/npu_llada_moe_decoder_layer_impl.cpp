@@ -1,0 +1,415 @@
+/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "npu_llada_moe_decoder_layer_impl.h"
+
+#include <gflags/gflags.h>
+
+#include <unordered_set>
+
+#include "common/global_flags.h"
+
+namespace xllm {
+namespace layer {
+
+static const uint64_t WEIGHT_COUNT_PER_LAYER = 55;
+
+LladaMoeDecoderLayerImpl::LladaMoeDecoderLayerImpl(const ModelContext& context,
+                                                   const int32_t layer_id)
+    : BaseLayer(context),
+      device_id_(context.get_tensor_options().device().index()),
+      layer_id_(layer_id),
+      num_speculative_tokens_(
+          context.get_model_args().num_speculative_tokens()) {
+  auto model_args = context.get_model_args();
+  auto parallel_args = context.get_parallel_args();
+  auto options = context.get_tensor_options();
+
+  num_experts_ = model_args.num_experts();
+  ep_size_ = parallel_args.ep_size();
+  ep_local_tp_size_ = parallel_args.world_size() / ep_size_;
+  CHECK_EQ(parallel_args.world_size(), ep_size_ * ep_local_tp_size_);
+  ep_local_tp_rank_ = parallel_args.rank() % ep_local_tp_size_;
+  num_experts_per_partition_ = model_args.num_experts() / ep_size_;
+  ep_rank_ = parallel_args.rank() / ep_local_tp_size_;
+  // int ep_rank = prefill_param_.rank /  ep_local_tp_size_;
+  start_expert_id_ = ep_rank_ * num_experts_per_partition_;
+  end_expert_id_ = start_expert_id_ + num_experts_per_partition_ - 1;
+
+  dp_size_ = parallel_args.dp_size();
+  dp_local_tp_size_ = parallel_args.world_size() / dp_size_;
+  CHECK_EQ(parallel_args.world_size(), dp_size_ * dp_local_tp_size_);
+  dp_local_tp_rank_ = parallel_args.rank() % dp_local_tp_size_;
+
+  param_from_args(prefill_param_, model_args, parallel_args, true);
+  param_from_args(decode_param_, model_args, parallel_args, false);
+  loader_ =
+      std::make_unique<Qwen3MoeDecoderLoader>(WEIGHT_COUNT_PER_LAYER, context);
+  initialize_tensors(options);
+}
+
+void LladaMoeDecoderLayerImpl::initialize_tensors(
+    const torch::TensorOptions& options) {
+  // initializ placeholder
+  atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
+  placeholder_vec_ = {1};
+  int_tensor_placeholder_ = torch::ones({1}).to(torch::kInt32).to(device_);
+  slot_tensor_placeholder_ = torch::full({1}, 0).to(torch::kInt32).to(device_);
+  block_tables_placeholder_ =
+      torch::zeros({1, 1}).to(torch::kInt32).to(device_);
+  tensor_placeholder_ = torch::zeros({1}).to(options);
+  loader_->resize_experts_weights(num_experts_per_partition_);
+  one_hot_ = torch::tensor({1}, torch::kInt32).to(device_);
+  zero_hot_ = torch::tensor({0}, torch::kInt32).to(device_);
+  expert_group_ = torch::tensor({1}, torch::dtype(torch::kInt32)).to(device_);
+}
+
+void LladaMoeDecoderLayerImpl::param_from_args(
+    atb_speed::qwen::MoeDecoderLayerParam& param,
+    const ModelArgs& args,
+    const ParallelArgs& parallel_args,
+    bool is_prefill) {
+  initialize_basic_parameters(param, args, parallel_args, is_prefill);
+  initialize_attention_parameters(param, args, parallel_args);
+  initialize_mlp_parameters(param, args, parallel_args);
+  initialize_parallel_parameters(param, parallel_args);
+  initialize_quantization_parameters(param);
+}
+
+void LladaMoeDecoderLayerImpl::initialize_basic_parameters(
+    atb_speed::qwen::MoeDecoderLayerParam& param,
+    const ModelArgs& args,
+    const ParallelArgs& parallel_args,
+    bool is_prefill) {
+  param.isFA = false;
+  param.isPrefill = is_prefill;
+  param.isBF16 = args.dtype() == "bfloat16";
+  param.enableSwiGLU = true;
+  param.enableLcoc = is_prefill;  // false;
+
+  param.mlpLinearTransposeType = {-1, -1, -1, -1};
+
+  param.enableSplitFuse =
+      (FLAGS_enable_chunked_prefill || FLAGS_enable_prefix_cache) && is_prefill;
+  if (quantize_type_.empty()) {
+    param.moeLinearTransposeType = std::vector<int>{1, 1, -1, 1};
+  } else {
+    param.moeLinearTransposeType = std::vector<int>{1, 0, -1, 1};
+  }
+  param.normEps = args.rms_norm_eps();
+  param.rank = parallel_args.rank();
+  param.backend = FLAGS_communication_backend;
+  // param.rankTableFile = FLAGS_rank_tablefile;
+
+  param.layerId = layer_id_;
+  param.numHiddenLayers = 0;
+  param.enableIntraLayerAddNorm = false;
+  param.enableInterLayerAddNorm = false;
+  if (quantize_type_.empty()) {
+    param.enableGMMSwigluQuant = false;
+  } else {
+    param.enableGMMSwigluQuant =
+        (is_prefill && parallel_args.world_size() > 16) || !is_prefill;
+  }
+
+  param.enableSpeculate = false;                    // MTP
+  param.enableSwiGLUQuantForSharedExperts = false;  // TODO
+
+  param.useQKNorm = true;
+  param.rmsnormQKNorm = true;
+  param.hiddenSizePerAttentionHead = args.head_dim();
+  std::optional<long int> optionalValue = args.n_kv_heads();
+  param.numKeyValueHeadsPerRank = std::max(
+      1, static_cast<int>(optionalValue.value()) / parallel_args.world_size());
+  param.numAttentionHeadsPerRank = args.n_heads() / dp_local_tp_size_;
+
+  param.attnLinearTransposeType = {1, -1, -1, 1, -1, -1};
+  param.worldSize = parallel_args.world_size();
+
+  if (is_prefill) {
+    param.enableAclnnRmsNorm = quantize_type_.empty();
+  }
+}
+
+void LladaMoeDecoderLayerImpl::initialize_attention_parameters(
+    atb_speed::qwen::MoeDecoderLayerParam& param,
+    const ModelArgs& args,
+    const ParallelArgs& parallel_args) {
+  param.enableFA3 = false;           // TODO
+  param.enableKvQuantLayer = false;  // TODO
+}
+
+void LladaMoeDecoderLayerImpl::initialize_mlp_parameters(
+    atb_speed::qwen::MoeDecoderLayerParam& param,
+    const ModelArgs& args,
+    const ParallelArgs& parallel_args) {
+  param.hasSharedExpert = (args.n_shared_experts() > 0);
+  param.hasSharedExpertGate = false;
+  param.processLogits = "normalization";
+  param.numOfSelectedExperts = {args.num_experts_per_tok()};
+
+  param.expertParallelDegree = 1;
+  param.enableFusedRouting = 1;
+  param.numOfExperts = args.num_experts();
+  param.maskStartIdx = 0;
+  param.routingMethod = "softMaxTopK";
+
+  param.quantGroupSize = 0;
+
+  param.enableInitQuant = false;
+  param.enableSwigluQuant = false;
+  param.enableCVOverlap = false;  // TODO
+}
+
+void LladaMoeDecoderLayerImpl::initialize_parallel_parameters(
+    atb_speed::qwen::MoeDecoderLayerParam& param,
+    const ParallelArgs& parallel_args) {
+  param.lmHeadLocalTp = dp_local_tp_size_;
+  param.mapping = parallel_args.mapping();
+  param.tensorParallelInfo = {parallel_args.rank(),
+                              parallel_args.world_size(),
+                              FLAGS_communication_backend,
+                              FLAGS_rank_tablefile,
+                              nullptr,
+                              ""};
+
+  param.maxDecodeDpTokenSize = 0;  // TODO
+}
+
+void LladaMoeDecoderLayerImpl::initialize_quantization_parameters(
+    atb_speed::qwen::MoeDecoderLayerParam& param) {
+  if (quantize_type_.empty()) {
+    param.packQuantType = {static_cast<int>(PackType::ALL_FP),
+                           static_cast<int>(PackType::ALL_FP)};
+    param.attnLinearQuantType = {static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::INVALID)};
+    param.mlpLinearQuantType = {static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID)};
+
+    param.moeLinearQuantType = {static_cast<int>(LinearType::FP),
+                                static_cast<int>(LinearType::FP),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::FP)};
+  } else {
+    param.packQuantType = {static_cast<int>(PackType::ALL_W8A8_DYNAMIC_ANTI),
+                           static_cast<int>(PackType::ALL_W8A8_DYNAMIC_ANTI)};
+    param.attnLinearQuantType = {static_cast<int>(LinearType::INT),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::INT),
+                                 static_cast<int>(LinearType::INVALID),
+                                 static_cast<int>(LinearType::INVALID)};
+    param.mlpLinearQuantType = {static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INVALID)};
+    param.moeLinearQuantType = {static_cast<int>(LinearType::FP),
+                                static_cast<int>(LinearType::INT),
+                                static_cast<int>(LinearType::INVALID),
+                                static_cast<int>(LinearType::INT)};
+  }
+}
+
+void LladaMoeDecoderLayerImpl::merge_loaded_weights() {
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
+int64_t LladaMoeDecoderLayerImpl::init_layer() {
+  name_ = "llada_moe_decoder_layer " + std::to_string(layer_id_);
+  model_name_ = "Llada_Moe";
+  CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
+  CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
+
+  return atb::NO_ERROR;
+}
+
+int64_t LladaMoeDecoderLayerImpl::init_node(
+    atb_speed::Model::Node& node,
+    atb_speed::qwen::MoeDecoderLayerParam& param) {
+  atb::Operation* operation = nullptr;
+  atb_speed::qwen::MoeDecoderLayer(param, &operation);
+  node.operation.reset(operation);
+  if (node.operation == nullptr) {
+    LOG(ERROR) << "node.operation is null";
+    return -1;
+  }
+  if (node.operation->GetInputNum() < 1) {
+    LOG(ERROR) << "Can not resize number which is smaller than 1";
+    return -1;
+  }
+  node.inTensors.resize(node.operation->GetInputNum());
+  node.outTensors.resize(1);
+  size_t inTensorId = 1;
+
+  for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
+       ++weightTensorId) {
+    node.inTensors.at(weightTensorId) = &atb_weight_tensors_[weightTensorId];
+  }
+
+  node.variantPack.inTensors.reserve(node.inTensors.size());
+  node.variantPack.inTensors.resize(node.inTensors.size());
+  node.variantPack.outTensors.reserve(1);
+  node.variantPack.outTensors.resize(1);
+
+  return atb::NO_ERROR;
+}
+
+torch::Tensor LladaMoeDecoderLayerImpl::forward(
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    torch::Tensor& expert_array,
+    aclrtEvent* event,
+    std::atomic<bool>* event_flag,
+    int node_id) {
+  atb::Status st;
+  if (!input_params.batch_forward_type.is_decode()) {
+    build_node_variant_pack(prefill_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            attn_mask,
+                            kv_cache,
+                            input_params,
+                            expert_array,
+                            true);
+    st = execute_node(prefill_node_, node_id, event, event_flag);
+    LOG_IF(FATAL, st != 0) << model_name_
+                           << "excute prefill layer fail, error code: " << st;
+  } else {
+    build_node_variant_pack(decode_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            /*attn_mask*/ tensor_placeholder_,
+                            kv_cache,
+                            input_params,
+                            expert_array,
+                            false);
+    st = execute_node(decode_node_, node_id + 1000, event, event_flag);
+    LOG_IF(FATAL, st != 0) << model_name_
+                           << "excute decode layer fail, error code: " << st;
+  }
+
+  return tensor_placeholder_;
+}
+
+void LladaMoeDecoderLayerImpl::build_node_variant_pack(
+    atb_speed::Model::Node& node,
+    torch::Tensor& x,
+    torch::Tensor& cos_pos,
+    torch::Tensor& sin_pos,
+    torch::Tensor& attn_mask,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    torch::Tensor& expert_array,
+    bool is_prefill) {
+  internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
+  int32_t input_idx = 0;
+  auto& dp_ep_padding = input_params.dp_ep_padding_data;
+
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensor_;
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
+      atb_speed::Utils::AtTensor2Tensor(expert_array);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 2) =
+      atb_speed::Utils::AtTensor2Tensor(expert_group_);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 3) =
+      atb_speed::Utils::AtTensor2Tensor(one_hot_);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 4) =
+      atb_speed::Utils::AtTensor2Tensor(zero_hot_);
+
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 5) =
+      atb_speed::Utils::AtTensor2Tensor(cos_pos);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 6) =
+      atb_speed::Utils::AtTensor2Tensor(sin_pos);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 7) =
+      atb_speed::Utils::AtTensor2Tensor(attn_mask);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 8) =
+      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
+      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
+
+  if (!input_params.block_tables.defined() ||
+      input_params.block_tables.storage().data() == nullptr) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
+        atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10).hostData =
+        const_cast<int32_t*>(placeholder_vec_.data());
+  } else {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.kv_seq_lens);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10).hostData =
+        const_cast<int32_t*>(input_params.kv_seq_lens_vec.data());
+  }
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
+      atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
+      atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12).hostData =
+      const_cast<int32_t*>(placeholder_vec_.data());
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 13) =
+      atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
+  if (!input_params.block_tables.defined() ||
+      input_params.block_tables.storage().data() == nullptr) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
+        atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
+  } else {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.block_tables);
+  }
+  if (!input_params.block_tables.defined() ||
+      input_params.block_tables.storage().data() == nullptr) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+        atb_speed::Utils::AtTensor2Tensor(slot_tensor_placeholder_);
+  } else {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slots);
+  }
+
+  if (is_prefill &&
+      (FLAGS_enable_chunked_prefill || FLAGS_enable_prefix_cache)) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.q_seq_lens);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16).hostData =
+        const_cast<int32_t*>(input_params.q_seq_lens_vec.data());
+  }
+
+  for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    CHECK_THROW(node.inTensors.at(i) == nullptr,
+                model_name_ << " inTensor " << i << " is NULL");
+    node.variantPack.inTensors.at(i) = *node.inTensors.at(i);
+  }
+
+  node.variantPack.outTensors.at(0) = internal_tensor_;
+}
+
+}  // namespace layer
+}  // namespace xllm
